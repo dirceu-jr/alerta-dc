@@ -1,6 +1,6 @@
 # Alerta DC
 
-Código e outros detalhes do protótipo de sistema para alerta de risco.
+Código e outros detalhes de protótipo de sistema de alerta de risco para areas sujeitas a alagamento.
 
 ## Lista de materiais
 
