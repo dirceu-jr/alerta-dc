@@ -1,12 +1,4 @@
 // TODO:
-// - Ping ThingSpeak Generic - DONE;
-// - Disable Wi-Fi - DONE;
-// - Disable Bluetooth - DONE;
-// - Check/disable GPS - DONE;
-// - ESP32 deep sleep - DONE;
-// - Water Level - DONE;
-// - Water Level Switch (use less battery) - DONE;
-// - errors inside loop() may deep-sleep again instead of retry; this ensure the modem is proper re-initialized - DONE;
 // - do not send "0" readings;
 // - more optimizations;
 
@@ -23,7 +15,7 @@
 // Chips without internal buffering (A6/A7, ESP8266, M590)
 // need enough space in the buffer for the entire response
 // else data will be lost (and the http library will fail).
-#define TINY_GSM_RX_BUFFER 1024
+// #define TINY_GSM_RX_BUFFER 1024
 
 // See all AT commands, if wanted
 // #define DUMP_AT_COMMANDS
@@ -31,6 +23,12 @@
 // Define the serial console for debug prints, if needed
 #define TINY_GSM_DEBUG SerialMon
 // #define LOGGING  // <- Logging is for the HTTP library
+
+#include "esp_wifi.h"
+#include "esp_bt.h"
+
+#include <TinyGsmClient.h>
+#include <ArduinoHttpClient.h>
 
 // Your GPRS credentials, if any
 const char apn[] = "iot.datatem.com.br";
@@ -42,12 +40,6 @@ const char server[] = "api.thingspeak.com";
 const int port = 443;
 
 const char* writeAPIKey = "RXF4B2VYF3HJIDNB";
-
-#include "esp_wifi.h"
-#include "esp_bt.h"
-
-#include <TinyGsmClient.h>
-#include <ArduinoHttpClient.h>
 
 #ifdef DUMP_AT_COMMANDS
 #include <StreamDebugger.h>
@@ -66,11 +58,7 @@ HttpClient    http(client, server, port);
 #define PWR_PIN     4
 #define LED_PIN     12
 #define LEVEL_PIN   2
-#define SWITCH_PIN  0
-
-// Sleep duration
-#define SLEEP_DURATION_ON_SUCCESS 300e6 // 5 minutes
-#define SLEEP_DURATION_ON_ERROR   60e6  // 1 minute
+#define SWITCH_PIN  15
 
 void modemPowerOn() {
   pinMode(PWR_PIN, OUTPUT);
@@ -84,6 +72,7 @@ void modemPowerOff() {
   digitalWrite(PWR_PIN, LOW);
   delay(1200); // Datasheet Ton mintues = 1.2S
   digitalWrite(PWR_PIN, HIGH);
+  pinMode(PWR_PIN, INPUT);
 }
 
 void modemHardReset() {
@@ -94,7 +83,7 @@ void modemHardReset() {
   delay(5000); // Wait 5 seconds for complete power up
 }
 
-void shutdownAndDeepSleep(bool error = false) {
+void disconnectAndPowerModemOff() {
   http.stop();
   SerialMon.println(F("Server disconnected"));
 
@@ -103,25 +92,13 @@ void shutdownAndDeepSleep(bool error = false) {
 
   // Power down the modem using AT command first
   SerialMon.println(F("Powering down modem with AT command..."));
-  modem.sendAT("+CPOWD=1");
-  modem.waitResponse();
+  modem.poweroff();
 
   // Then turn off the modem power
   SerialMon.println(F("Powering off modem pin..."));
   modemPowerOff();
 
-  // Set this pin to LOW to avoid the modem to turn ON after esp32 enter deep sleep
-  digitalWrite(PWR_PIN, LOW);
-
   SerialMon.println(F("Modem off"));
-
-  if (error) {
-    SerialMon.println(F("Entering deep sleep due to error..."));
-    ESP.deepSleep(SLEEP_DURATION_ON_ERROR);
-  } else {
-    SerialMon.println(F("Entering deep sleep for success..."));
-    ESP.deepSleep(SLEEP_DURATION_ON_SUCCESS);
-  }
 }
 
 unsigned long readWaterLevel() {
@@ -147,7 +124,72 @@ unsigned long readWaterLevel() {
   return maxDuration;
 }
 
+bool connectAndSendData(float distance_cm) {
+  SerialMon.print("Signal quality: ");
+  SerialMon.println(modem.getSignalQuality());
+
+  SerialMon.print("Waiting for network...");
+  if (!modem.waitForNetwork()) {
+    SerialMon.println(" fail");
+    return false;
+  }
+  SerialMon.println(" success");
+
+  if (modem.isNetworkConnected()) {
+    SerialMon.println("Network connected");
+  }
+
+  // GPRS connection parameters are usually set after network registration
+  if (modem.isGprsConnected()) {
+    SerialMon.println("GPRS already connected.");
+  } else {
+    SerialMon.print(F("Connecting to "));
+    SerialMon.print(apn);
+    if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+      SerialMon.println(" fail");
+      return false;
+    }
+    SerialMon.println(" success");
+  }
+
+  if (modem.isGprsConnected()) {
+    SerialMon.println("GPRS connected.");
+  }
+
+  // Now try HTTPS request
+  http.setTimeout(30000);
+  http.connectionKeepAlive(); // this may be needed for HTTPS
+
+  // Construct the resource URL
+  String resource = String("/update?api_key=") + writeAPIKey + "&field1=" + String(distance_cm);
+
+  SerialMon.print(F("Performing HTTPS GET request... "));
+  int err = http.get(resource);
+  if (err != 0) {
+    SerialMon.print(F("failed to connect, error: "));
+    SerialMon.println(err);
+    return false;
+  }
+
+  int status = http.responseStatusCode();
+  SerialMon.print(F("Response status code: "));
+  SerialMon.println(status);
+  if (status <= 0) {
+    return false;
+  }
+
+  String body = http.responseBody();
+  SerialMon.println(F("Response:"));
+  SerialMon.println(body);
+
+  return true;
+}
+
 void setup() {
+  // Disable Wi-Fi and Bluetooth
+  esp_wifi_stop();
+  esp_bt_controller_disable();
+
   // Set LED OFF
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
@@ -159,11 +201,6 @@ void setup() {
   SerialMon.begin(115200);
   delay(1000);
 
-  // Disable Wi-Fi and Bluetooth
-  SerialMon.println(F("Disabling Wi-Fi and Bluetooth..."));
-  esp_wifi_stop();
-  esp_bt_controller_disable();
-
   // always hard reset modem
   modemHardReset();
 
@@ -173,18 +210,13 @@ void setup() {
 
   // Restart takes quite some time
   // To skip it, call init() instead of restart()
-  SerialMon.println("Restating modem...");
+  // SerialMon.println("Restarting modem...");
   // modem.restart();
+  SerialMon.println("Initializing modem...");
   modem.init();
 
   // update modem clock (if not exact at least 'more recent')
   modem.sendAT("+CCLK=\"25/08/20,19:52:00\"");
-
-  // print modem clock
-  String clock_res;
-  modem.sendAT("+CCLK?");
-  modem.waitResponse(1000L, clock_res);
-  SerialMon.println(clock_res);
 
   // Disable GPS
   modem.disableGPS();
@@ -227,76 +259,19 @@ void setup() {
 }
 
 void loop() {
-  // modem.gprsConnect(apn, gprsUser, gprsPass);
-
-  SerialMon.print("Signal quality: ");
-  SerialMon.println(modem.getSignalQuality());
-
-  SerialMon.print("Waiting for network...");
-  if (!modem.waitForNetwork()) {
-    SerialMon.println(" fail");
-    // !!!
-    shutdownAndDeepSleep(true);
-  }
-  SerialMon.println(" success");
-
-  if (modem.isNetworkConnected()) {
-    SerialMon.println("Network connected");
-  }
-
-  // GPRS connection parameters are usually set after network registration
-  if (modem.isGprsConnected()) {
-    SerialMon.println("GPRS already connected.");
-  } else {
-    SerialMon.print(F("Connecting to "));
-    SerialMon.print(apn);
-    if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
-      SerialMon.println(" fail");
-      // !!!
-      shutdownAndDeepSleep(true);
-    }
-    SerialMon.println(" success");
-  }
-
-  if (modem.isGprsConnected()) {
-    SerialMon.println("GPRS connected.");
-  }
-
-  // Now try HTTPS request
-  http.setTimeout(30000);
-  http.connectionKeepAlive(); // this may be needed for HTTPS
-
   unsigned long maxDuration = readWaterLevel();
   // convert to centimetres
   float distance_cm = (float)maxDuration / 10;
 
-  SerialMon.print("Distance (cm): ");
-  SerialMon.println(distance_cm);
+  bool success = connectAndSendData(distance_cm);
 
-  // Construct the resource URL
-  String resource = String("/update?api_key=") + writeAPIKey + "&field1=" + String(distance_cm);
+  disconnectAndPowerModemOff();
 
-  SerialMon.print(F("Performing HTTPS GET request... "));
-  int err = http.get(resource);
-  if (err != 0) {
-    SerialMon.print(F("failed to connect, error: "));
-    SerialMon.println(err);
-    // !!!
-    shutdownAndDeepSleep(true);
+  if (success) {
+    SerialMon.println(F("Entering deep sleep for success..."));
+    ESP.deepSleep(300e6); // 5 minutes
+  } else {
+    SerialMon.println(F("Entering deep sleep due to error..."));
+    ESP.deepSleep(60e6); // 1 minute
   }
-
-  int status = http.responseStatusCode();
-  SerialMon.print(F("Response status code: "));
-  SerialMon.println(status);
-  if (!status) {
-    delay(10000);
-    return;
-  }
-
-  String body = http.responseBody();
-  SerialMon.println(F("Response:"));
-  SerialMon.println(body);
-
-  // Shutdown and deep-sleep
-  shutdownAndDeepSleep(false);
 }
